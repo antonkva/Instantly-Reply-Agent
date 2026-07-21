@@ -1,0 +1,13 @@
+{
+  "name": "reply-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Webhook receiver for Instantly reply automation",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.22.2"
+  }
+}
