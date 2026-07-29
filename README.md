@@ -5,12 +5,56 @@ This is the first piece of the pipeline: a server that receives Instantly's
 3x within 30s if you're slow), and logs the payload so you can see its real
 shape before building the Claude classification step on top of it.
 
+## 0. Set up Airtable (client configs)
+
+Client configs live in Airtable now, not a local file — this lets you (or
+a VA) add and edit clients without touching code. Clients and campaigns
+are separate tables so a client with multiple campaigns just gets
+multiple rows in `Campaigns`, all pointing at the same client — no need
+to duplicate their ICP/tone/etc.
+
+1. Create a new Airtable base with three tables, matching these fields
+   exactly (case-sensitive):
+
+   **Clients**: `client_name`, `icp`, `tone_notes`, `offer_summary`,
+   `calendar_provider`, `calendar_link`, `escalation_contact`,
+   `auto_send_allowed` (checkbox)
+
+   **Campaigns**: `campaign_id`, `campaign_name`, `client` (link to Clients)
+
+   **Objections**: `client` (link to Clients), `pattern`, `guidance`
+
+2. Add one row per client in `Clients` — this is the config that stays
+   the same regardless of how many campaigns they're running.
+3. Add one row per campaign in `Campaigns`, linking each to the right
+   client. The `campaign_id` must exactly match what Instantly sends in
+   its webhook payload — check your Render logs from a real reply, or
+   Instantly's campaign settings, to get the exact value. If a client
+   starts a new campaign later, this is the only table you touch — just
+   add a new row.
+4. Add a few rows in `Objections` for each client, linking each one back
+   to the right client via the `client` link field.
+5. Create a Personal Access Token at airtable.com/create/tokens (Airtable
+   retired plain API keys in 2024 — PATs are the current method). Give it:
+   - Scopes: `data.records:read`
+   - Access: the specific base you just created
+6. Copy your base ID — it's the part of your base's URL starting with
+   `app...` (e.g. `airtable.com/appXXXXXXXXXXXXXX/...`).
+
+## 0.5 Get a Gemini API key (for classification/drafting)
+
+1. Go to aistudio.google.com, sign in, and click **Get API key** → **Create API key**.
+2. Copy it — starts with `AIza`.
+3. You'll add this as `GEMINI_API_KEY` in Render's environment variables (step below).
+
+Cost note: each reply triggers one Gemini API call. Gemini 3.5 Flash is priced for exactly this kind of high-volume, low-complexity task, so at normal reply volumes for a cold email agency this is a very small ongoing cost — worth checking Google AI Studio's usage page once live, but not something to worry about upfront.
+
 ## 1. Run it locally (optional, just to see it work)
 
 ```bash
 npm install
 cp .env.example .env
-# edit .env, set INSTANTLY_WEBHOOK_SECRET to any long random string
+# edit .env: set INSTANTLY_WEBHOOK_SECRET, AIRTABLE_TOKEN, AIRTABLE_BASE_ID
 npm start
 ```
 
@@ -46,9 +90,12 @@ You should get `{"received":true}` and see the payload logged in your terminal.
    - **Build Command**: `npm install`
    - **Start Command**: `npm start`
    - **Instance Type**: **Free**
-5. Under **Environment**, add an environment variable:
+5. Under **Environment**, add environment variables:
    - `INSTANTLY_WEBHOOK_SECRET` = a long random string (generate one with
      `openssl rand -hex 32`)
+   - `AIRTABLE_TOKEN` = your personal access token (starts with `pat`)
+   - `AIRTABLE_BASE_ID` = your base ID (starts with `app`)
+   - `GEMINI_API_KEY` = your Gemini API key (starts with `AIza`)
 6. Click **Create Web Service**. Render builds and deploys automatically.
    Once live, it gives you a public URL like
    `https://reply-agent.onrender.com`.
