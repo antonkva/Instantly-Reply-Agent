@@ -1,12 +1,17 @@
 import express from "express";
-import crypto from "crypto";
 import { getClientByCampaignId } from "./lib/clients.js";
 import { classifyAndDraftReply } from "./lib/gemini.js";
+import {
+  sendApprovalMessage,
+  sendNotification,
+  answerCallbackQuery,
+  getPendingDraft,
+  updatePendingDraft,
+  deletePendingDraft,
+} from "./lib/telegram.js";
 
 const app = express();
 
-// Instantly sends JSON. Capture the raw body too, in case you later
-// want to verify a signature header against it.
 app.use(
   express.json({
     limit: "10mb",
@@ -18,10 +23,12 @@ app.use(
 
 const WEBHOOK_SECRET = process.env.INSTANTLY_WEBHOOK_SECRET;
 
-// Simple shared-secret check. When you create the webhook in Instantly,
-// you set a custom header (see README) — this checks it matches.
+const AUTO_SEND_CONFIDENCE = 0.99;
+const AUTO_SEND_INTENTS = ["book_call"];
+const SUPPRESS_INTENTS = ["unsubscribe", "auto_reply_or_ooo"];
+
 function verifySecret(req) {
-  if (!WEBHOOK_SECRET) return true; // no secret configured yet, allow through (dev only)
+  if (!WEBHOOK_SECRET) return true;
   const incoming = req.get("X-Webhook-Secret");
   return incoming === WEBHOOK_SECRET;
 }
@@ -37,36 +44,50 @@ app.post("/webhooks/instantly", async (req, res) => {
   }
 
   const event = req.body;
-
-  // Respond immediately — Instantly retries 3x within 30s if you're slow
-  // or don't return a 2xx. Don't do the Claude API call before responding.
   res.status(200).json({ received: true });
 
-  // Log what actually comes through so you can see the real payload shape
-  // for reply_received events (field names can vary slightly by event type).
   console.log("Event type:", event.event_type ?? event.eventType ?? "unknown");
   console.log("Payload:", JSON.stringify(event, null, 2));
 
-  // --- Next steps (not yet implemented here) ---
-  // 1. Check event.event_type === "reply_received"
-  // 2. Look up the client config for event.campaign / event.organization
-  // 3. Call the Claude API with the reply text + client config
-  // 4. Route to auto-send or chat approval based on confidence
   processReplyEvent(event).catch((err) =>
     console.error("Error processing reply event:", err)
   );
 });
 
+app.post("/webhooks/telegram", async (req, res) => {
+  res.status(200).json({ ok: true });
+
+  const callbackQuery = req.body.callback_query;
+  if (!callbackQuery) return;
+
+  const [action, id] = callbackQuery.data.split(":");
+  const draft = getPendingDraft(id);
+
+  if (!draft) {
+    await answerCallbackQuery(callbackQuery.id, "This draft is no longer available.");
+    return;
+  }
+
+  if (action === "send") {
+    updatePendingDraft(id, { status: "approved" });
+    console.log(`APPROVED for send — client: ${draft.client.client_name}, lead: ${draft.event.lead_email}`);
+    console.log(`Draft text: ${draft.classification.draft_reply}`);
+    await answerCallbackQuery(callbackQuery.id, "Marked as approved (Instantly send not yet wired up).");
+  } else if (action === "delete") {
+    deletePendingDraft(id);
+    await answerCallbackQuery(callbackQuery.id, "Deleted — no reply will be sent.");
+  } else if (action === "edit") {
+    await answerCallbackQuery(callbackQuery.id, "Edit isn't wired up yet — reply here manually for now.");
+  }
+});
+
 async function processReplyEvent(event) {
   if (event.event_type !== "reply_received") {
-    return; // only act on actual replies for now
+    return;
   }
 
   const client = await getClientByCampaignId(event.campaign_id);
   if (!client) {
-    // No config yet for this campaign — add a row to Airtable's Campaigns
-    // table with this exact campaign_id, linked to the right client.
-    // Logged already inside getClientByCampaignId.
     return;
   }
 
@@ -83,11 +104,36 @@ async function processReplyEvent(event) {
 
   console.log("Classification result:", JSON.stringify(result, null, 2));
 
-  // --- Next step (not yet implemented): ---
-  // Route based on result.intent / result.confidence:
-  //   - unsubscribe / auto_reply_or_ooo -> suppress, no reply, no human review
-  //   - confidence >= 0.99 and intent in allowlist -> auto-send via Instantly
-  //   - everything else -> send draft to chat platform for human approval
+  if (SUPPRESS_INTENTS.includes(result.intent)) {
+    console.log(`Suppressing — intent "${result.intent}", no reply, no approval needed.`);
+    return;
+  }
+
+  const shouldAutoSend =
+    AUTO_SEND_INTENTS.includes(result.intent) && result.confidence >= AUTO_SEND_CONFIDENCE;
+
+  if (shouldAutoSend) {
+    console.log(`AUTO-SEND — intent "${result.intent}" at ${result.confidence} confidence.`);
+    try {
+      await sendNotification(
+        `*Auto-sent* (${client.client_name})\n${event.firstName ?? event.lead_email}\n\n${result.draft_reply}\n\n_(Instantly send not yet wired up — logged only for now)_`
+      );
+    } catch (err) {
+      console.error("Telegram notification failed:", err.message);
+    }
+    return;
+  }
+
+  if (!result.requires_draft) {
+    console.log(`No draft required for intent "${result.intent}" — nothing further to do.`);
+    return;
+  }
+
+  try {
+    await sendApprovalMessage(client, event, result);
+  } catch (err) {
+    console.error("Failed to send Telegram approval message:", err.message);
+  }
 }
 
 const PORT = process.env.PORT || 3000;
