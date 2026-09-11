@@ -49,6 +49,28 @@ to duplicate their ICP/tone/etc.
 
 Cost note: each reply triggers one Gemini API call. Gemini 3.5 Flash is priced for exactly this kind of high-volume, low-complexity task, so at normal reply volumes for a cold email agency this is a very small ongoing cost — worth checking Google AI Studio's usage page once live, but not something to worry about upfront.
 
+## 0.75 Set up your Telegram bot
+
+1. In Telegram, message **@BotFather**, send `/newbot`, follow the prompts. It gives you a **bot token** like `123456789:ABCdefGhIJKlmNoPQRstuVwxyz`.
+2. Send your new bot any message (e.g. "hi") so it has something to look up.
+3. Find your **chat ID** by visiting this URL in a browser (replace with your real token):
+   ```
+   https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
+   ```
+   Look for `"chat":{"id":123456789,...}` in the response — that number is your chat ID.
+4. You'll add both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to Render's environment variables (step below).
+5. **After deploying**, register the webhook so Telegram knows where to send button taps:
+   ```bash
+   curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://YOUR-RENDER-URL.onrender.com/webhooks/telegram"
+   ```
+   You should get back `{"ok":true,"result":true,...}`.
+
+## 0.85 Get an Instantly API v2 key (for sending approved replies)
+
+1. In Instantly: **Settings → Integrations → API**, generate a v2 key (v1 was deprecated in January 2026 — make sure it's v2).
+2. Needs the `emails:create` scope (or `all:create`/`all:all`) to send replies.
+3. You'll add this as `INSTANTLY_API_KEY` in Render's environment variables (step below). Note this is a different key from the one used earlier to register the webhook — same account, but worth generating one scoped specifically for this if Instantly's UI allows it.
+
 ## 1. Run it locally (optional, just to see it work)
 
 ```bash
@@ -96,6 +118,9 @@ You should get `{"received":true}` and see the payload logged in your terminal.
    - `AIRTABLE_TOKEN` = your personal access token (starts with `pat`)
    - `AIRTABLE_BASE_ID` = your base ID (starts with `app`)
    - `GEMINI_API_KEY` = your Gemini API key (starts with `AIza`)
+   - `TELEGRAM_BOT_TOKEN` = your bot token from BotFather
+   - `TELEGRAM_CHAT_ID` = your chat ID from the getUpdates step
+   - `INSTANTLY_API_KEY` = your Instantly v2 API key with send scope
 6. Click **Create Web Service**. Render builds and deploys automatically.
    Once live, it gives you a public URL like
    `https://reply-agent.onrender.com`.

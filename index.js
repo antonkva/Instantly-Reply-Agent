@@ -1,6 +1,7 @@
 import express from "express";
 import { getClientByCampaignId } from "./lib/clients.js";
 import { classifyAndDraftReply } from "./lib/gemini.js";
+import { sendReply } from "./lib/instantly.js";
 import {
   sendApprovalMessage,
   sendNotification,
@@ -12,8 +13,6 @@ import {
 
 const app = express();
 
-// Instantly sends JSON. Capture the raw body too, in case you later
-// want to verify a signature header against it.
 app.use(
   express.json({
     limit: "10mb",
@@ -25,17 +24,12 @@ app.use(
 
 const WEBHOOK_SECRET = process.env.INSTANTLY_WEBHOOK_SECRET;
 
-// Auto-send threshold: only intents in this list, at or above this
-// confidence, skip human approval entirely.
 const AUTO_SEND_CONFIDENCE = 0.99;
 const AUTO_SEND_INTENTS = ["book_call"];
-
-// Intents that should never get a drafted reply or approval message —
-// only internal suppression (marking the lead as do-not-contact).
 const SUPPRESS_INTENTS = ["unsubscribe", "auto_reply_or_ooo"];
 
 function verifySecret(req) {
-  if (!WEBHOOK_SECRET) return true; // no secret configured yet, allow through (dev only)
+  if (!WEBHOOK_SECRET) return true;
   const incoming = req.get("X-Webhook-Secret");
   return incoming === WEBHOOK_SECRET;
 }
@@ -61,35 +55,43 @@ app.post("/webhooks/instantly", async (req, res) => {
   );
 });
 
-// Telegram sends button taps here.
 app.post("/webhooks/telegram", async (req, res) => {
   res.status(200).json({ ok: true }); // ack immediately
 
+  console.log("Telegram webhook received:", JSON.stringify(req.body, null, 2));
+
   const callbackQuery = req.body.callback_query;
-  if (!callbackQuery) return; // not a button tap we care about (e.g. a text message)
+  if (!callbackQuery) {
+    console.log("Not a button tap (no callback_query) — ignoring.");
+    return;
+  }
 
   const [action, id] = callbackQuery.data.split(":");
+  console.log(`Button tapped: action="${action}", id="${id}"`);
   const draft = getPendingDraft(id);
 
   if (!draft) {
+    console.warn(`No pending draft found for id "${id}" — may have expired or server restarted.`);
     await answerCallbackQuery(callbackQuery.id, "This draft is no longer available.");
     return;
   }
 
   if (action === "send") {
-    // TODO: actually call Instantly's send-reply API here. For now this
-    // just marks it approved and logs — real sending is the next step.
-    updatePendingDraft(id, { status: "approved" });
-    console.log(`APPROVED for send — client: ${draft.client.client_name}, lead: ${draft.event.lead_email}`);
-    console.log(`Draft text: ${draft.classification.draft_reply}`);
-    await answerCallbackQuery(callbackQuery.id, "Marked as approved (Instantly send not yet wired up).");
+    try {
+      await sendReply(draft.event, draft.classification.draft_reply);
+      deletePendingDraft(id);
+      console.log(`SENT via Instantly — client: ${draft.client.client_name}, lead: ${draft.event.lead_email}`);
+      await answerCallbackQuery(callbackQuery.id, "Sent!");
+    } catch (err) {
+      console.error("Instantly send failed:", err.message);
+      await answerCallbackQuery(callbackQuery.id, "Failed to send — check Render logs. Draft is still pending.");
+    }
   } else if (action === "delete") {
     deletePendingDraft(id);
+    console.log(`Draft ${id} deleted by user.`);
     await answerCallbackQuery(callbackQuery.id, "Deleted — no reply will be sent.");
   } else if (action === "edit") {
-    // TODO: real editing needs a follow-up text message from you, captured
-    // and matched back to this draft. Not yet implemented — flagging it
-    // clearly rather than pretending it works.
+    console.log(`Edit tapped for draft ${id} — not yet implemented.`);
     await answerCallbackQuery(callbackQuery.id, "Edit isn't wired up yet — reply here manually for now.");
   }
 });
@@ -118,23 +120,29 @@ async function processReplyEvent(event) {
   console.log("Classification result:", JSON.stringify(result, null, 2));
 
   if (SUPPRESS_INTENTS.includes(result.intent)) {
-    // TODO: mark lead as do-not-contact in Instantly. For now, just log.
     console.log(`Suppressing — intent "${result.intent}", no reply, no approval needed.`);
     return;
   }
 
   const shouldAutoSend =
-    AUTO_SEND_INTENTS.includes(result.intent) && result.confidence >= AUTO_SEND_CONFIDENCE;
+    AUTO_SEND_INTENTS.includes(result.intent) &&
+    result.confidence >= AUTO_SEND_CONFIDENCE &&
+    !result.requires_scheduling;
 
   if (shouldAutoSend) {
-    // TODO: actually call Instantly's send-reply API here.
-    console.log(`AUTO-SEND — intent "${result.intent}" at ${result.confidence} confidence.`);
     try {
+      await sendReply(event, result.draft_reply);
+      console.log(`AUTO-SENT via Instantly — intent "${result.intent}" at ${result.confidence} confidence.`);
       await sendNotification(
-        `Auto-sent (${client.client_name})\n${event.firstName ?? event.lead_email}\n\n${result.draft_reply}\n\n(Instantly send not yet wired up — logged only for now)`
+        `Auto-sent (${client.client_name})\n${event.firstName ?? event.lead_email}\n\n${result.draft_reply}`
       );
     } catch (err) {
-      console.error("Telegram notification failed:", err.message);
+      console.error("Auto-send failed:", err.message);
+      try {
+        await sendApprovalMessage(client, event, result);
+      } catch (err2) {
+        console.error("Fallback approval message also failed:", err2.message);
+      }
     }
     return;
   }
