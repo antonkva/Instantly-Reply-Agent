@@ -4,11 +4,15 @@ import { classifyAndDraftReply } from "./lib/gemini.js";
 import { sendReply } from "./lib/instantly.js";
 import {
   sendApprovalMessage,
+  resendDraftMessage,
   sendNotification,
   answerCallbackQuery,
   getPendingDraft,
   updatePendingDraft,
   deletePendingDraft,
+  setAwaitingEdit,
+  getAwaitingEditDraftId,
+  clearAwaitingEdit,
 } from "./lib/telegram.js";
 
 const app = express();
@@ -61,38 +65,70 @@ app.post("/webhooks/telegram", async (req, res) => {
   console.log("Telegram webhook received:", JSON.stringify(req.body, null, 2));
 
   const callbackQuery = req.body.callback_query;
-  if (!callbackQuery) {
-    console.log("Not a button tap (no callback_query) — ignoring.");
-    return;
-  }
+  const message = req.body.message;
 
-  const [action, id] = callbackQuery.data.split(":");
-  console.log(`Button tapped: action="${action}", id="${id}"`);
-  const draft = getPendingDraft(id);
+  if (callbackQuery) {
+    const chatId = callbackQuery.message?.chat?.id;
+    const [action, id] = callbackQuery.data.split(":");
+    console.log(`Button tapped: action="${action}", id="${id}"`);
+    const draft = getPendingDraft(id);
 
-  if (!draft) {
-    console.warn(`No pending draft found for id "${id}" — may have expired or server restarted.`);
-    await answerCallbackQuery(callbackQuery.id, "This draft is no longer available.");
-    return;
-  }
-
-  if (action === "send") {
-    try {
-      await sendReply(draft.event, draft.classification.draft_reply);
-      deletePendingDraft(id);
-      console.log(`SENT via Instantly — client: ${draft.client.client_name}, lead: ${draft.event.lead_email}`);
-      await answerCallbackQuery(callbackQuery.id, "Sent!");
-    } catch (err) {
-      console.error("Instantly send failed:", err.message);
-      await answerCallbackQuery(callbackQuery.id, "Failed to send — check Render logs. Draft is still pending.");
+    if (!draft) {
+      console.warn(`No pending draft found for id "${id}" — may have expired or server restarted.`);
+      await answerCallbackQuery(callbackQuery.id, "This draft is no longer available.");
+      return;
     }
-  } else if (action === "delete") {
-    deletePendingDraft(id);
-    console.log(`Draft ${id} deleted by user.`);
-    await answerCallbackQuery(callbackQuery.id, "Deleted — no reply will be sent.");
-  } else if (action === "edit") {
-    console.log(`Edit tapped for draft ${id} — not yet implemented.`);
-    await answerCallbackQuery(callbackQuery.id, "Edit isn't wired up yet — reply here manually for now.");
+
+    if (action === "send") {
+      try {
+        await sendReply(draft.event, draft.classification.draft_reply);
+        deletePendingDraft(id);
+        console.log(`SENT via Instantly — client: ${draft.client.client_name}, lead: ${draft.event.lead_email}`);
+        await answerCallbackQuery(callbackQuery.id, "Sent!");
+      } catch (err) {
+        console.error("Instantly send failed:", err.message);
+        await answerCallbackQuery(callbackQuery.id, "Failed to send — check Render logs. Draft is still pending.");
+      }
+    } else if (action === "delete") {
+      deletePendingDraft(id);
+      console.log(`Draft ${id} deleted by user.`);
+      await answerCallbackQuery(callbackQuery.id, "Deleted — no reply will be sent.");
+    } else if (action === "edit") {
+      setAwaitingEdit(chatId, id);
+      console.log(`Now awaiting edit text for draft ${id} from chat ${chatId}.`);
+      await answerCallbackQuery(callbackQuery.id, "Reply to this chat with the new draft text.");
+    }
+    return;
+  }
+
+  if (message && message.text) {
+    const chatId = message.chat?.id;
+    const awaitingId = getAwaitingEditDraftId(chatId);
+
+    if (!awaitingId) {
+      console.log("Plain message received but no edit in progress — ignoring.");
+      return;
+    }
+
+    const draft = getPendingDraft(awaitingId);
+    if (!draft) {
+      console.warn(`Edit text received but draft ${awaitingId} no longer exists.`);
+      clearAwaitingEdit(chatId);
+      await sendNotification("That draft is no longer available — edit cancelled.");
+      return;
+    }
+
+    updatePendingDraft(awaitingId, {
+      classification: { ...draft.classification, draft_reply: message.text },
+    });
+    clearAwaitingEdit(chatId);
+    console.log(`Draft ${awaitingId} updated with new text from user.`);
+
+    try {
+      await resendDraftMessage(awaitingId);
+    } catch (err) {
+      console.error("Failed to resend updated draft:", err.message);
+    }
   }
 });
 
