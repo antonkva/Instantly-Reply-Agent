@@ -1,7 +1,8 @@
 import express from "express";
 import { getClientByCampaignId } from "./lib/clients.js";
 import { classifyAndDraftReply } from "./lib/gemini.js";
-import { sendReply } from "./lib/instantly.js";
+import { sendReply, forwardEmailToClient } from "./lib/instantly.js";
+import { upsertLead, WARM_INTENTS } from "./lib/leads.js";
 import {
   sendApprovalMessage,
   resendDraftMessage,
@@ -31,6 +32,9 @@ const WEBHOOK_SECRET = process.env.INSTANTLY_WEBHOOK_SECRET;
 const AUTO_SEND_CONFIDENCE = 0.99;
 const AUTO_SEND_INTENTS = ["book_call"];
 const SUPPRESS_INTENTS = ["unsubscribe", "auto_reply_or_ooo"];
+// Intents that trigger forwarding to the client's own inbox, for
+// campaigns with "Forward Interested Leads" enabled in Airtable.
+const FORWARD_INTENTS = ["book_call", "interested"];
 
 function verifySecret(req) {
   if (!WEBHOOK_SECRET) return true;
@@ -155,15 +159,40 @@ async function processReplyEvent(event) {
 
   console.log("Classification result:", JSON.stringify(result, null, 2));
 
+  if (WARM_INTENTS.includes(result.intent)) {
+    try {
+      await upsertLead(client, event);
+    } catch (err) {
+      console.error("Lead capture failed:", err.message);
+    }
+  }
+
+  if (client.forward_interested_leads && FORWARD_INTENTS.includes(result.intent)) {
+    try {
+      await forwardEmailToClient(event, client.client_email);
+      console.log(`Forwarded original email to ${client.client_email} for lead ${event.lead_email}`);
+    } catch (err) {
+      console.error("Lead forward failed:", err.message);
+    }
+    try {
+      await sendNotification(
+        `Forwarded to ${client.client_name} (${client.client_email})\n${event.firstName ?? event.lead_email}\n\n${event.reply_text_snippet ?? ""}`
+      );
+    } catch (err) {
+      console.error("Telegram forward notification failed:", err.message);
+    }
+  }
+
   if (SUPPRESS_INTENTS.includes(result.intent)) {
     console.log(`Suppressing — intent "${result.intent}", no reply, no approval needed.`);
     return;
   }
 
+  const bookingAutoSendSafe = !result.requires_scheduling || client.auto_send_bookings;
   const shouldAutoSend =
     AUTO_SEND_INTENTS.includes(result.intent) &&
     result.confidence >= AUTO_SEND_CONFIDENCE &&
-    !result.requires_scheduling;
+    bookingAutoSendSafe;
 
   if (shouldAutoSend) {
     try {
