@@ -2,7 +2,7 @@ import express from "express";
 import { getClientByCampaignId } from "./lib/clients.js";
 import { classifyAndDraftReply } from "./lib/gemini.js";
 import { sendReply, forwardEmailToClient } from "./lib/instantly.js";
-import { upsertLead, WARM_INTENTS } from "./lib/leads.js";
+import { upsertLead, WARM_INTENTS } from "./lib/sheets.js";
 import {
   sendApprovalMessage,
   resendDraftMessage,
