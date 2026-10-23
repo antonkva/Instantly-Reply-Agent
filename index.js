@@ -161,7 +161,7 @@ async function processReplyEvent(event) {
 
   if (WARM_INTENTS.includes(result.intent)) {
     try {
-      await upsertLead(client, event);
+      await upsertLead(client, event, result);
     } catch (err) {
       console.error("Lead capture failed:", err.message);
     }
